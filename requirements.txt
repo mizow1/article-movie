@@ -11,3 +11,5 @@ trafilatura==1.6.3
 moviepy==1.0.3
 beautifulsoup4==4.12.2
 lxml==4.9.3
+gunicorn==21.2.0
+httpx==0.24.1

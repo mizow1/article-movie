@@ -21,4 +21,4 @@ COPY . .
 EXPOSE 8080
 
 # 実行コマンド
-CMD ["python", "app.py"]
+CMD ["gunicorn", "--workers", "1", "--timeout", "3600", "-b", "0.0.0.0:8080", "app:app"]
