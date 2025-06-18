@@ -19,13 +19,37 @@ from googleapiclient.http import MediaFileUpload
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials as OAuthCreds
 
+# ------------------------------------------------------------
+# ロギング設定
+# ------------------------------------------------------------
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", force=True)
+
+# ----------------------------------------------------------------------------
+# OpenAI コンテンツモデレーション補助関数
+# ----------------------------------------------------------------------------
+
+def log_moderation(text: str, context: str = ""):
+    """OpenAI Moderation API で NG カテゴリを検出しログに残す。失敗しても処理を止めない。"""
+    if DISABLE_NARRATION:
+        return
+    try:
+        mod = client.moderations.create(model="omni-moderation-latest", input=text[:5000])
+        result = mod.results[0]
+        logging.info("moderation (%s): flagged=%s, categories=%s", context, result.flagged, result.categories)
+    except Exception:
+        logging.exception("moderation (%s): API call failed", context)
+
+
 # ----------------------------------------------------------------------------
 # 環境変数 & 定数
 # ----------------------------------------------------------------------------
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+OPENAI_API_KEY = (os.environ.get("OPENAI_API_KEY") or "").strip()
 SHEET_URL = os.environ.get("SHEET_URL")  # 例: https://docs.google.com/...
 DRIVE_FOLDER_ID = os.environ.get("DRIVE_FOLDER_ID")  # 共有ドライブ内のフォルダID
 # Secret Manager で以下を注入: GCP_SA_JSON_SECRET, YOUTUBE_TOKEN_JSON
+DISABLE_IMAGE_GEN = os.environ.get("DISABLE_IMAGE_GEN") == "1"
+DISABLE_NARRATION = os.environ.get("DISABLE_NARRATION") == "1"
 
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
@@ -69,7 +93,16 @@ def get_youtube_creds():
 def get_sheet():
     creds = get_service_account_creds()
     gc = gspread.authorize(creds)
-    return gc.open_by_url(SHEET_URL).sheet1
+    url = SHEET_URL.split("#")[0].split("?")[0] if SHEET_URL else ""
+    try:
+        return gc.open_by_url(url).sheet1
+    except gspread.exceptions.NoValidUrlKeyFound:
+        # fallback: extract key manually
+        import re
+        m = re.search(r"/d/([\w-]+)", url)
+        if not m:
+            raise
+        return gc.open_by_key(m.group(1)).sheet1
 
 # ----------------------------------------------------------------------------
 # 1) 記事取得
@@ -77,7 +110,9 @@ def get_sheet():
 
 def fetch_article(url: str) -> str:
     text_parts, visited = [], set()
+    logging.info(f"fetch_article: start url={url}")
     while url and url not in visited:
+        logging.info("fetch_article: visiting %s", url)
         visited.add(url)
         resp = requests.get(url, timeout=15)
         article_text = trafilatura.extract(resp.text, favor_recall=True)
@@ -93,27 +128,62 @@ def fetch_article(url: str) -> str:
 # ----------------------------------------------------------------------------
 
 def generate_images(article: str, n: int = 3):
+    # 画像生成無効化フラグ
+    if DISABLE_IMAGE_GEN:
+        logging.info("generate_images: disabled via env var, returning empty list")
+        return []
+
+    # 1) シーン説明文を取得 --------------------------------------------------
     prompt = (
         "以下の記事内容を読んで、ニュース動画用の背景シーン説明を" f"{n}個、日本語で1行ずつ出力してください。"
     )
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt + "\n\n" + article[:4000]}],
-    )
+    logging.info("generate_images: prompt=%s", prompt)
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt + "\n\n" + article[:4000]}],
+        )
+    except Exception as e:
+        logging.exception("generate_images: scene generation failed")
+        raise
+
     scenes = [l.strip() for l in resp.choices[0].message.content.splitlines() if l.strip()]
+    logging.info("generate_images: scenes=%s", scenes)
+    # 各シーンと記事本文のモデレーション結果を記録
+    log_moderation(article[:8000], "article")
+    for s in scenes:
+        log_moderation(s, "scene")
+
+    # 2) 各シーンを画像化 ------------------------------------------------------
     paths = []
     for i, scene in enumerate(scenes[:n]):
-        img_resp = client.images.generate(
-            model="dall-e-3",
-            prompt=scene,
-            size="1024x1024",
-        )
-        url = img_resp.data[0].url
-        raw = requests.get(url).content
-        path = f"/tmp/scene_{i}.png"
-        with open(path, "wb") as fp:
-            fp.write(raw)
-        paths.append(path)
+        retries = 0
+        while retries < 3:
+            try:
+                logging.info("generate_images: request image scene=%s", scene)
+                img_resp = client.images.generate(
+                    model="dall-e-3",
+                    prompt=scene,
+                    size="1024x1024",
+                )
+                url = img_resp.data[0].url
+                logging.info("generate_images: image url=%s", url)
+                raw = requests.get(url, timeout=30).content
+                path = f"/tmp/scene_{i}.png"
+                with open(path, "wb") as fp:
+                    fp.write(raw)
+                paths.append(path)
+                break  # success
+            except Exception as e:
+                retries += 1
+                logging.exception(
+                    "generate_images: image generation failed (attempt %d/3) scene=%s", retries, scene
+                )
+                if retries == 3:
+                    logging.error("generate_images: giving up on scene %s after 3 retries", scene)
+        
+    if not paths:
+        raise RuntimeError("generate_images: failed to generate any images")
     return paths
 
 # ----------------------------------------------------------------------------
@@ -121,16 +191,25 @@ def generate_images(article: str, n: int = 3):
 # ----------------------------------------------------------------------------
 
 def create_narration(article: str) -> str:
+    if DISABLE_NARRATION:
+        logging.info("create_narration: disabled via env, returning placeholder text")
+        return "概要: ニュース動画"
     prompt = (
         "次のニュース記事本文を、自然な日本語の朗読原稿に整形してください。\n"
         "・見出し行の後に改行で間を取る\n"
         "・不自然な表現は口語に言い換える\n"
         "・全体で3分以内に収まるよう要約も可\n\n記事:\n" + article[:8000]
     )
-    res = client.chat.completions.create(
-        model="gpt-4o-mini",
+    try:
+        if DISABLE_NARRATION:
+            raise RuntimeError("DISABLE_NARRATION active")  # should not reach here
+        res = client.chat.completions.create(
+        model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
     )
+    except Exception:
+        logging.exception("create_narration: OpenAI chat completion failed for article snippet=%s", article[:500])
+        raise
     return res.choices[0].message.content.strip()
 
 # ----------------------------------------------------------------------------
@@ -148,7 +227,15 @@ def synthesize_speech(text: str) -> str:
         audio_encoding=texttospeech.AudioEncoding.MP3,
         speaking_rate=1.05,
     )
-    audio = tts.synthesize_speech(input_text, voice, audio_cfg)
+    try:
+        audio = tts.synthesize_speech(
+            input=input_text,
+            voice=voice,
+            audio_config=audio_cfg,
+        )
+    except Exception:
+        logging.exception("synthesize_speech: Google TTS failed for text snippet=%s", text[:200])
+        raise
     out_path = "/tmp/voice.mp3"
     with open(out_path, "wb") as fp:
         fp.write(audio.audio_content)
@@ -161,8 +248,13 @@ def synthesize_speech(text: str) -> str:
 def make_video(images: list[str], voice_path: str) -> str:
     audio_clip = AudioFileClip(voice_path)
     duration = audio_clip.duration
-    img_duration = duration / len(images)
-    clips = [ImageClip(p).set_duration(img_duration) for p in images]
+    if images:
+        img_duration = duration / len(images)
+        clips = [ImageClip(p).set_duration(img_duration) for p in images]
+    else:
+        # 黒背景のみで動画を生成
+        from moviepy.editor import ColorClip
+        clips = [ColorClip(size=(1280, 720), color=(0, 0, 0)).set_duration(duration)]
     video = concatenate_videoclips(clips, method="compose").set_audio(audio_clip)
     out_path = "/tmp/news_video.mp4"
     video.write_videofile(out_path, codec="libx264", audio_codec="aac", fps=30)
@@ -173,11 +265,20 @@ def make_video(images: list[str], voice_path: str) -> str:
 # ----------------------------------------------------------------------------
 
 def upload_drive(file_path: str) -> str:
+    """Upload video to Google Drive folder and return share URL."""
     creds = get_service_account_creds()
     drive = build("drive", "v3", credentials=creds)
+
+    # フォルダ存在確認（shared drive も考慮して supportsAllDrives=True）
+    try:
+        drive.files().get(fileId=DRIVE_FOLDER_ID, fields="id", supportsAllDrives=True).execute()
+    except Exception as e:
+        logging.error("upload_drive: folder id %s not accessible: %s", DRIVE_FOLDER_ID, e)
+        raise
+
     meta = {"name": Path(file_path).name, "parents": [DRIVE_FOLDER_ID]}
     media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
-    file = drive.files().create(body=meta, media_body=media, fields="id").execute()
+    file = drive.files().create(body=meta, media_body=media, fields="id", supportsAllDrives=True).execute()
     # 公開リンク作成
     drive.permissions().create(fileId=file["id"], body={"role": "reader", "type": "anyone"}).execute()
     return f"https://drive.google.com/file/d/{file['id']}/view"
@@ -239,6 +340,7 @@ def health():
 
 @app.route("/process", methods=["POST"])
 def process():
+    logging.info("/process: start processing spreadsheet rows")
     results = []
     sheet = get_sheet()
     rows = sheet.get_all_values()[1:]  # ヘッダー除外
@@ -251,6 +353,7 @@ def process():
                 res["status"] = "success"
                 results.append(res)
             except Exception as e:
+                logging.exception("process_row failed")
                 sheet.update(f"D{idx}", str(e))
                 results.append({"row": idx, "error": str(e)})
     return jsonify(results)
