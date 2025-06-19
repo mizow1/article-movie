@@ -387,16 +387,23 @@ def generate_srt_file(script: str, duration: float, out_path: str = "/tmp/captio
 def synthesize_speech(text: str, with_timepoints: bool = False):
     """読み上げ用原稿を SSML へ変換して Google TTS で合成。"""
     ssml = prepare_tts_script(text)
-    # TimepointType はライブラリバージョンで場所が異なる場合があるため安全に取得
+    # TimepointType はライブラリバージョンで場所が異なるため探索する
+    enable_tp = None
     if with_timepoints:
-        try:
-            TimepointType = texttospeech.TimepointType  # type: ignore[attr-defined]
-        except AttributeError:
-            from google.cloud.texttospeech_v1.types import SynthesizeSpeechRequest as _SSR  # type: ignore
-            TimepointType = _SSR.TimepointType  # type: ignore
-        enable_tp = [TimepointType.WORD]
-    else:
-        enable_tp = None
+        TimepointType = None
+        # 1) 最新版 (google.cloud.texttospeech.TimepointType)
+        TimepointType = getattr(texttospeech, "TimepointType", None)
+        if TimepointType is None:
+            # 2) v1 ラッパ (google.cloud.texttospeech_v1.types.SynthesizeSpeechRequest.TimepointType)
+            try:
+                from google.cloud import texttospeech_v1  # type: ignore
+                TimepointType = texttospeech_v1.types.SynthesizeSpeechRequest.TimepointType  # type: ignore
+            except Exception:
+                TimepointType = None
+        if TimepointType is None:
+            logging.warning("synthesize_speech: TimepointType enum not found, proceeding without word timepoints")
+        else:
+            enable_tp = [TimepointType.WORD]
 
     creds = get_service_account_creds()
     tts = texttospeech.TextToSpeechClient(credentials=creds)
