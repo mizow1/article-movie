@@ -235,8 +235,9 @@ def prepare_tts_script(raw_text: str) -> str:
     }
 
     text = raw_text
-    # Markdown 見出しやリスト記号を削除
-    text = re.sub(r"^[#*]+\\s*", "", text, flags=re.M)
+    # Markdown 記号 (行頭/行中の #,*,-,数字. など) を削除
+    text = re.sub(r"^[#*\-\d\.]+\s*", "", text, flags=re.M)  # 行頭
+    text = re.sub(r"\s[#*]{1,6}\s*", " ", text)  # 行中
     # URL を削除
     text = re.sub(r"https?://\S+", "", text)
     # 余分な空白を縮約 (全角スペースは保持し、後でポーズへ変換)
@@ -386,7 +387,18 @@ def upload_youtube(file_path: str, title: str, caption: str | None = None, publi
 
 def update_sheet(row: int, drive_url: str, yt_url: str, script: str, article: str):
     sheet = get_sheet()
-    updates: dict[str,str] = {}
+    # 個別セル更新 (値が多いと batch_update で列がずれることがあるため)
+    if drive_url:
+        sheet.update(f"B{row}", drive_url)
+    if yt_url:
+        sheet.update(f"C{row}", yt_url)
+    if article:
+        sheet.update(f"G{row}", article[:5000])
+    if script:
+        sheet.update(f"H{row}", script[:5000])
+    # フラグを 2 へ
+    sheet.update(f"E{row}", "2")
+    return
     if drive_url:
         updates[f"B{row}"] = drive_url
     if yt_url:
@@ -470,9 +482,9 @@ def process():
     sheet = get_sheet()
     rows = sheet.get_all_values()[1:]  # ヘッダー除外
     for idx, r in enumerate(rows, start=2):
-        url = r[0] if len(r) else ""
-        exec_flag = r[4] if len(r) > 4 else ""
-        publish_date = r[5] if len(r) > 5 else ""
+        # パディングして列数を揃える
+        r = (r + [""] * 8)[:8]
+        url, exec_flag, publish_date = r[0], r[4], r[5]
         publish_at = None
         if publish_date:
             try:
