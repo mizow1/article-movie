@@ -386,8 +386,8 @@ def upload_youtube(file_path: str, title: str, caption: str | None = None, publi
 # ----------------------------------------------------------------------------
 
 def update_sheet(row: int, drive_url: str, yt_url: str, script: str, article: str):
+    """指定行の各セルを更新し、生成フラグを 2 にセットする。"""
     sheet = get_sheet()
-    # セル個別更新（batch_update で構造エラーが出るため簡潔に行う）
     if drive_url:
         sheet.update(f"B{row}", drive_url)
     if yt_url:
@@ -398,16 +398,6 @@ def update_sheet(row: int, drive_url: str, yt_url: str, script: str, article: st
         sheet.update(f"H{row}", script[:5000])
     # フラグを 2 へ
     sheet.update(f"E{row}", "2")
-    return
-        updates[f"B{row}"] = drive_url
-    if yt_url:
-        updates[f"C{row}"] = yt_url
-    if article:
-        updates[f"G{row}"] = article[:5000]
-    if script:
-        updates[f"H{row}"] = script[:5000]
-    # フラグを 2 へ
-    updates[f"E{row}"] = "2"
     if updates:
         # batch_update で一括反映
         data = [{"range": k, "values": [[v]]} for k, v in updates.items()]
