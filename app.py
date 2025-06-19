@@ -268,9 +268,126 @@ def prepare_tts_script(raw_text: str) -> str:
 
     return f"<speak>{''.join(ssml_lines)}</speak>"
 
-def synthesize_speech(text: str) -> str:
+# ----------------------------------------------------------------------------
+# 字幕分割 & SRT 生成
+# ----------------------------------------------------------------------------
+
+def _split_long_sentence(sentence: str, max_len: int) -> list[str]:
+    """句点で分割した後、さらに長い文は読点や単語単位で分割"""
+    import re
+    if len(sentence) <= max_len:
+        return [sentence]
+    segments: list[str] = []
+    parts = sentence.split("、")  # 読点で分割
+    buf = ""
+    for i, part in enumerate(parts):
+        part = part.strip()
+        if not part:
+            continue
+        add = ("、" if i < len(parts) - 1 else "") + part
+        if len(buf) + len(add) > max_len and buf:
+            segments.append(buf + ("。" if not buf.endswith("。") else ""))
+            buf = part + ("、" if i < len(parts) - 1 else "")
+        else:
+            buf += add
+    if buf:
+        if not buf.endswith("。"):
+            buf += "。"
+        segments.append(buf)
+    # fallback: still too long, brute split
+    result: list[str] = []
+    for seg in segments:
+        while len(seg) > max_len:
+            result.append(seg[:max_len])
+            seg = seg[max_len:]
+        if seg:
+            result.append(seg)
+    return result or [sentence]
+
+def segment_subtitles(text: str, max_len: int = 50) -> list[str]:
+    """原稿テキストを字幕セグメントへ分割"""
+    import re
+    sentences = re.split(r"(?<=。)\s*", text)
+    segments: list[str] = []
+    for s in sentences:
+        s = s.strip()
+        if not s:
+            continue
+        if len(s) > max_len:
+            segments.extend(_split_long_sentence(s, max_len))
+        else:
+            segments.append(s)
+    return segments
+
+def _sec_to_ts(sec: float) -> str:
+    hrs = int(sec // 3600)
+    mins = int((sec % 3600) // 60)
+    secs = int(sec % 60)
+    ms = int((sec - int(sec)) * 1000)
+    return f"{hrs:02}:{mins:02}:{secs:02},{ms:03}"
+
+def _align_segments_to_timepoints(segments: list[str], timepoints: list) -> list[tuple[float, float]]:
+    """単語タイムスタンプを用いて各セグメントの開始・終了秒を返す"""
+    # timepoints: list of google.cloud.texttospeech.Timepoint
+    if not timepoints:
+        return []
+    # 時系列ソート
+    tp = sorted(timepoints, key=lambda x: x.time_seconds)
+    # word list from script
+    words = []
+    import re
+    for s in segments:
+        words.extend(re.findall(r"\w+", s))
+    if len(words) == 0 or len(tp) < len(words):
+        return []
+    # Map each word to timepoint index (assume 1-1)
+    seg_times: list[tuple[float, float]] = []
+    w_idx = 0
+    for s in segments:
+        w_cnt = len(re.findall(r"\w+", s))
+        start = tp[w_idx].time_seconds
+        end = tp[min(w_idx + w_cnt - 1, len(tp)-1)].time_seconds
+        seg_times.append((start, end))
+        w_idx += w_cnt
+    return seg_times
+
+def generate_srt_file(script: str, duration: float, out_path: str = "/tmp/captions.srt", timepoints: list | None = None) -> str:
+    """原稿と総尺から単純均等割りでSRTファイルを生成"""
+    segments = segment_subtitles(script)
+    if not segments:
+        return ""
+    # 正確なタイムスタンプがあれば使用
+    seg_times: list[tuple[float, float]] = []
+    if timepoints:
+        seg_times = _align_segments_to_timepoints(segments, timepoints)
+    if seg_times and len(seg_times) == len(segments):
+        mode = "tp"
+    else:
+        mode = "even"
+    total_chars = sum(len(s) for s in segments)
+    if total_chars == 0 or duration <= 0:
+        # Duration 未取得の場合は帰る
+        return ""
+    cur = 0.0
+    with open(out_path, "w", encoding="utf-8") as fp:
+        for idx, seg in enumerate(segments, 1):
+            if mode == "tp" and seg_times:
+                start, end = seg_times[idx-1]
+            else:
+                seg_len = len(seg)
+                seg_dur = duration * seg_len / total_chars
+                start = cur
+                end = cur + seg_dur
+            fp.write(f"{idx}\n")
+            fp.write(f"{_sec_to_ts(start)} --> {_sec_to_ts(end)}\n")
+            fp.write(f"{seg}\n\n")
+            cur = end
+    return out_path
+
+def synthesize_speech(text: str, with_timepoints: bool = False):
     """読み上げ用原稿を SSML へ変換して Google TTS で合成。"""
     ssml = prepare_tts_script(text)
+    enable_tp = [texttospeech.TimepointType.WORD] if with_timepoints else None
 
     creds = get_service_account_creds()
     tts = texttospeech.TextToSpeechClient(credentials=creds)
@@ -287,6 +404,7 @@ def synthesize_speech(text: str) -> str:
             input=input_text,
             voice=voice,
             audio_config=audio_cfg,
+            enable_time_pointing=enable_tp,  # type: ignore[arg-type]
         )
     except Exception:
         logging.exception("synthesize_speech: Google TTS failed for text snippet=%s", text[:200])
@@ -294,6 +412,8 @@ def synthesize_speech(text: str) -> str:
     out_path = "/tmp/voice.mp3"
     with open(out_path, "wb") as fp:
         fp.write(audio.audio_content)
+    if with_timepoints:
+        return out_path, list(getattr(audio, "timepoints", []))
     return out_path
 
 # ----------------------------------------------------------------------------
@@ -342,7 +462,7 @@ def upload_drive(file_path: str) -> str:
 # 7) YouTube アップロード
 # ----------------------------------------------------------------------------
 
-def upload_youtube(file_path: str, title: str, caption: str | None = None, publish_at: str | None = None) -> str:
+def upload_youtube(file_path: str, title: str, caption: str | None = None, publish_at: str | None = None, srt_path: str | None = None) -> str:
     yt_creds = get_youtube_creds()
     yt = build("youtube", "v3", credentials=yt_creds)
     body = {
@@ -362,7 +482,27 @@ def upload_youtube(file_path: str, title: str, caption: str | None = None, publi
     req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
     resp = req.execute()
 
-    # キャプションを挿入 (表記原稿)
+    # SRT 字幕があればアップロード
+    if srt_path and Path(srt_path).exists():
+        try:
+            from googleapiclient.http import MediaFileUpload as _MFU
+            media = _MFU(srt_path, mimetype="application/x-subrip", resumable=False)
+            yt.captions().insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "language": "ja",
+                        "name": "Japanese",
+                        "videoId": resp["id"],
+                        "isDraft": False,
+                    }
+                },
+                media_body=media,
+            ).execute()
+        except Exception:
+            logging.exception("upload_youtube: SRT upload failed")
+
+    # プレーンテキスト原稿をキャプションとして挿入 (fallback)
     if caption:
         try:
             from googleapiclient.http import MediaInMemoryUpload
@@ -438,8 +578,17 @@ def process_row(row: int, url: str, publish_at: str | None = None):
         logging.info("process_row: row %d skipped (%s)", row, reason)
         return {"row": row, "skipped": True, "reason": reason}
 
-    # 音声合成
-    voice = synthesize_speech(script)
+    # 音声合成 (単語タイムポイント取得付き)
+    voice, tps = synthesize_speech(script, with_timepoints=True)
+
+    try:
+        from moviepy.editor import AudioFileClip as _AFC
+        duration = _AFC(voice).duration
+    except Exception:
+        logging.exception("Failed to open voice file for duration, fallback 0")
+        duration = 0.0
+    srt_path = generate_srt_file(script, duration, timepoints=tps)
+
     # 動画生成
     video = make_video(images, voice)
     # アップロード
@@ -450,9 +599,10 @@ def process_row(row: int, url: str, publish_at: str | None = None):
         script.split("\n")[0][:50],
         caption=caption_text,
         publish_at=publish_at,
+        srt_path=srt_path,
     )
     update_sheet(row, drive_url, yt_url, script, article)
-    return {"row": row, "drive": drive_url, "yt": yt_url}
+    return {"row": row, "drive": drive_url, "yt": yt_url, "srt": srt_path}
 
 # ----------------------------------------------------------------------------
 # Flask ルーティング
