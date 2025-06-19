@@ -213,13 +213,60 @@ def create_narration(article: str) -> str:
     return res.choices[0].message.content.strip()
 
 # ----------------------------------------------------------------------------
-# 4) 音声合成 (Google TTS)
+# 4) 朗読原稿処理 & 音声合成 (Google TTS)
 # ----------------------------------------------------------------------------
 
+def prepare_tts_script(raw_text: str) -> str:
+    """TTS 用にテキストを SSML に整形する。
+
+    ・見出しの前後に長めのポーズ (<break>) を挿入
+    ・記号や URL は読み飛ばす
+    ・連続空白を整理
+    ・辞書で指定した漢字をふりがなへ置換
+    """
+    import re, html
+
+    # 誤読しやすい漢字 → よみがな 辞書
+    KANJI_READING: dict[str, str] = {
+        "刷新": "さっしん",
+        "行使": "こうし",
+        "一段": "いちだん",
+    }
+
+    text = raw_text
+    # Markdown 見出しやリスト記号を削除
+    text = re.sub(r"^[#*]+\\s*", "", text, flags=re.M)
+    # URL を削除
+    text = re.sub(r"https?://\S+", "", text)
+    # 余分な空白を縮約
+    text = re.sub(r"[ \t]+", " ", text)
+
+    # 辞書で漢字を置換
+    if KANJI_READING:
+        pattern = re.compile("|".join(map(re.escape, KANJI_READING.keys())))
+        text = pattern.sub(lambda m: KANJI_READING[m.group(0)], text)
+
+    # 行単位で SSML
+    ssml_lines: list[str] = []
+    for line in text.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # 見出し判定: 30文字以内かつ記号少なめ
+        if len(line) <= 30 and not re.search(r"[。.,]", line):
+            ssml_lines.append(f"<break time=\"700ms\"/>{html.escape(line)}<break time=\"700ms\"/>")
+        else:
+            ssml_lines.append(f"{html.escape(line)}<break time=\"300ms\"/>")
+
+    return f"<speak>{''.join(ssml_lines)}</speak>"
+
 def synthesize_speech(text: str) -> str:
+    """読み上げ用原稿を SSML へ変換して Google TTS で合成。"""
+    ssml = prepare_tts_script(text)
+
     creds = get_service_account_creds()
     tts = texttospeech.TextToSpeechClient(credentials=creds)
-    input_text = texttospeech.SynthesisInput(text=text)
+    input_text = texttospeech.SynthesisInput(ssml=ssml)
     voice = texttospeech.VoiceSelectionParams(
         language_code="ja-JP", name="ja-JP-Standard-B"
     )
