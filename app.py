@@ -239,7 +239,7 @@ def prepare_tts_script(raw_text: str) -> str:
     text = re.sub(r"^[#*]+\\s*", "", text, flags=re.M)
     # URL を削除
     text = re.sub(r"https?://\S+", "", text)
-    # 余分な空白を縮約
+    # 余分な空白を縮約 (全角スペースは保持し、後でポーズへ変換)
     text = re.sub(r"[ \t]+", " ", text)
 
     # 辞書で漢字を置換
@@ -249,6 +249,9 @@ def prepare_tts_script(raw_text: str) -> str:
 
     # 行単位で SSML
     ssml_lines: list[str] = []
+    # 行内の全角スペースをポーズへ変換
+    text = text.replace("　", "<break time=\"300ms\"/>")
+
     for line in text.strip().splitlines():
         line = line.strip()
         if not line:
@@ -335,38 +338,75 @@ def upload_drive(file_path: str) -> str:
 # 7) YouTube アップロード
 # ----------------------------------------------------------------------------
 
-def upload_youtube(file_path: str, title: str) -> str:
+def upload_youtube(file_path: str, title: str, caption: str | None = None, publish_at: str | None = None) -> str:
     yt_creds = get_youtube_creds()
     yt = build("youtube", "v3", credentials=yt_creds)
     body = {
         "snippet": {
             "title": title,
-            "description": title,
+            "description": caption or title,
             "categoryId": "25",
         },
-        "status": {"privacyStatus": "public"},
+        "status": {},
     }
+    if publish_at:
+        # 予約公開
+        body["status"].update({"privacyStatus": "private", "publishAt": publish_at})
+    else:
+        body["status"].update({"privacyStatus": "public"})
     media = MediaFileUpload(file_path, resumable=True, mimetype="video/mp4")
     req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
     resp = req.execute()
+
+    # キャプションを挿入 (表記原稿)
+    if caption:
+        try:
+            from googleapiclient.http import MediaInMemoryUpload
+            media = MediaInMemoryUpload(caption.encode("utf-8"), mimetype="text/plain")
+            yt.captions().insert(
+                part="snippet",
+                body={
+                    "snippet": {
+                        "language": "ja",
+                        "name": "Japanese",
+                        "videoId": resp["id"],
+                        "isDraft": False,
+                    }
+                },
+                media_body=media,
+            ).execute()
+        except Exception:
+            logging.exception("upload_youtube: caption upload failed")
+
     return f"https://youtu.be/{resp['id']}"
 
 # ----------------------------------------------------------------------------
 # 8) スプレッドシート更新
 # ----------------------------------------------------------------------------
 
-def update_sheet(row: int, drive_url: str, yt_url: str):
+def update_sheet(row: int, drive_url: str, yt_url: str, script: str, article: str):
     sheet = get_sheet()
+    updates: dict[str,str] = {}
     if drive_url:
-        sheet.update(f"B{row}", drive_url)
+        updates[f"B{row}"] = drive_url
     if yt_url:
-        sheet.update(f"C{row}", yt_url)
+        updates[f"C{row}"] = yt_url
+    if article:
+        updates[f"G{row}"] = article[:5000]
+    if script:
+        updates[f"H{row}"] = script[:5000]
+    # フラグを 2 へ
+    updates[f"E{row}"] = "2"
+    if updates:
+        # batch_update で一括反映
+        data = [{"range": k, "values": [[v]]} for k, v in updates.items()]
+        sheet.batch_update({"valueInputOption": "RAW", "data": data})
 
 # ----------------------------------------------------------------------------
 # メイン処理関数
 # ----------------------------------------------------------------------------
 
-def process_row(row: int, url: str):
+def process_row(row: int, url: str, publish_at: str | None = None):
     sheet = get_sheet()
     article = fetch_article(url)
 
@@ -404,8 +444,14 @@ def process_row(row: int, url: str):
     video = make_video(images, voice)
     # アップロード
     drive_url = upload_drive(video)
-    yt_url = upload_youtube(video, script.split("\n")[0][:50])
-    update_sheet(row, drive_url, yt_url)
+    caption_text = article
+    yt_url = upload_youtube(
+        video,
+        script.split("\n")[0][:50],
+        caption=caption_text,
+        publish_at=publish_at,
+    )
+    update_sheet(row, drive_url, yt_url, script, article)
     return {"row": row, "drive": drive_url, "yt": yt_url}
 
 # ----------------------------------------------------------------------------
@@ -425,10 +471,22 @@ def process():
     rows = sheet.get_all_values()[1:]  # ヘッダー除外
     for idx, r in enumerate(rows, start=2):
         url = r[0] if len(r) else ""
-        done = r[1] if len(r) > 1 else ""
-        if url and not done:
+        exec_flag = r[4] if len(r) > 4 else ""
+        publish_date = r[5] if len(r) > 5 else ""
+        publish_at = None
+        if publish_date:
             try:
-                res = process_row(idx, url)
+                from datetime import datetime, timezone, timedelta
+                dt = datetime.fromisoformat(publish_date)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))
+                if dt > datetime.now(dt.tzinfo):
+                    publish_at = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            except Exception:
+                logging.warning("Invalid publish_date format: %s", publish_date)
+        if url and exec_flag == "1":
+            try:
+                res = process_row(idx, url, publish_at)
                 res["status"] = "success"
                 results.append(res)
             except Exception as e:
