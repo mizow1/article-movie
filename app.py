@@ -130,7 +130,7 @@ def fetch_article(url: str) -> str:
 def generate_images(article: str, n: int = 3):
     # 画像生成無効化フラグ
     if DISABLE_IMAGE_GEN:
-        logging.info("generate_images: disabled via env var, returning empty list")
+        logging.info("generate_images: disabled via env var, skipping image generation")
         return []
 
     # 1) シーン説明文を取得 --------------------------------------------------
@@ -192,8 +192,8 @@ def generate_images(article: str, n: int = 3):
 
 def create_narration(article: str) -> str:
     if DISABLE_NARRATION:
-        logging.info("create_narration: disabled via env, returning placeholder text")
-        return "概要: ニュース動画"
+        logging.error("create_narration: disabled via env, aborting")
+        raise RuntimeError("ナレーション生成無効 (DISABLE_NARRATION=1)")
     prompt = (
         "次のニュース記事本文を、自然な日本語の朗読原稿に整形してください。\n"
         "・見出し行の後に改行で間を取る\n"
@@ -201,8 +201,6 @@ def create_narration(article: str) -> str:
         "・全体で3分以内に収まるよう要約も可\n\n記事:\n" + article[:8000]
     )
     try:
-        if DISABLE_NARRATION:
-            raise RuntimeError("DISABLE_NARRATION active")  # should not reach here
         res = client.chat.completions.create(
         model="gpt-4o",
         messages=[{"role": "user", "content": prompt}],
@@ -210,7 +208,10 @@ def create_narration(article: str) -> str:
     except Exception:
         logging.exception("create_narration: OpenAI chat completion failed for article snippet=%s", article[:500])
         raise
-    return res.choices[0].message.content.strip()
+    script = res.choices[0].message.content.strip()
+    if not script:
+        raise RuntimeError("create_narration: empty script from OpenAI")
+    return script
 
 # ----------------------------------------------------------------------------
 # 4) 朗読原稿処理 & 音声合成 (Google TTS)
@@ -366,11 +367,41 @@ def update_sheet(row: int, drive_url: str, yt_url: str):
 # ----------------------------------------------------------------------------
 
 def process_row(row: int, url: str):
+    sheet = get_sheet()
     article = fetch_article(url)
-    images = generate_images(article)
-    script = create_narration(article)
+
+    # 画像生成
+    images: list[str] = []
+    try:
+        images = generate_images(article)
+    except Exception as e:
+        sheet.update(f"D{row}", f"画像生成失敗: {e}")
+        raise
+
+    # ナレーション生成
+    script = ""
+    try:
+        script = create_narration(article)
+    except Exception as e:
+        sheet.update(f"D{row}", f"原稿生成失敗: {e}")
+        raise
+
+    # 判定: 画像または原稿が無い場合はスキップ扱い
+    if not images or not script.strip():
+        reason = []
+        if not images:
+            reason.append("画像なし")
+        if not script.strip():
+            reason.append("原稿なし")
+        sheet.update(f"D{row}", "/".join(reason) or "スキップ")
+        logging.info("process_row: row %d skipped (%s)", row, reason)
+        return {"row": row, "skipped": True, "reason": reason}
+
+    # 音声合成
     voice = synthesize_speech(script)
+    # 動画生成
     video = make_video(images, voice)
+    # アップロード
     drive_url = upload_drive(video)
     yt_url = upload_youtube(video, script.split("\n")[0][:50])
     update_sheet(row, drive_url, yt_url)
