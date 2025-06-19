@@ -387,7 +387,7 @@ def upload_youtube(file_path: str, title: str, caption: str | None = None, publi
 
 def update_sheet(row: int, drive_url: str, yt_url: str, script: str, article: str):
     sheet = get_sheet()
-    # 個別セル更新 (値が多いと batch_update で列がずれることがあるため)
+    # セル個別更新（batch_update で構造エラーが出るため簡潔に行う）
     if drive_url:
         sheet.update(f"B{row}", drive_url)
     if yt_url:
@@ -399,7 +399,6 @@ def update_sheet(row: int, drive_url: str, yt_url: str, script: str, article: st
     # フラグを 2 へ
     sheet.update(f"E{row}", "2")
     return
-    if drive_url:
         updates[f"B{row}"] = drive_url
     if yt_url:
         updates[f"C{row}"] = yt_url
@@ -484,7 +483,7 @@ def process():
     for idx, r in enumerate(rows, start=2):
         # パディングして列数を揃える
         r = (r + [""] * 8)[:8]
-        url, exec_flag, publish_date = r[0], r[4], r[5]
+        url, exec_flag, publish_date = r[0], r[4].strip(), r[5]
         publish_at = None
         if publish_date:
             try:
