@@ -250,8 +250,9 @@ def prepare_tts_script(raw_text: str) -> str:
 
     # 行単位で SSML
     ssml_lines: list[str] = []
-    # 行内の全角スペースをポーズへ変換
-    text = text.replace("　", "<break time=\"300ms\"/>")
+    # 行内の全角スペースをポーズへ変換（Escape 前にプレースホルダーに置換し、あとで SSML タグへ戻す）
+    BREAK_TOKEN = "__BR300__"
+    text = text.replace("　", BREAK_TOKEN)
 
     for line in text.strip().splitlines():
         line = line.strip()
@@ -259,9 +260,11 @@ def prepare_tts_script(raw_text: str) -> str:
             continue
         # 見出し判定: 30文字以内かつ記号少なめ
         if len(line) <= 30 and not re.search(r"[。.,]", line):
-            ssml_lines.append(f"<break time=\"700ms\"/>{html.escape(line)}<break time=\"700ms\"/>")
+            escaped = html.escape(line).replace(BREAK_TOKEN, '<break time="300ms"/>')
+            ssml_lines.append(f"<break time=\"700ms\"/>{escaped}<break time=\"700ms\"/>")
         else:
-            ssml_lines.append(f"{html.escape(line)}<break time=\"300ms\"/>")
+            escaped = html.escape(line).replace(BREAK_TOKEN, '<break time="300ms"/>')
+            ssml_lines.append(f"{escaped}<break time=\"300ms\"/>")
 
     return f"<speak>{''.join(ssml_lines)}</speak>"
 
@@ -398,10 +401,6 @@ def update_sheet(row: int, drive_url: str, yt_url: str, script: str, article: st
         sheet.update(f"H{row}", script[:5000])
     # フラグを 2 へ
     sheet.update(f"E{row}", "2")
-    if updates:
-        # batch_update で一括反映
-        data = [{"range": k, "values": [[v]]} for k, v in updates.items()]
-        sheet.batch_update({"valueInputOption": "RAW", "data": data})
 
 # ----------------------------------------------------------------------------
 # メイン処理関数
