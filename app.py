@@ -387,7 +387,16 @@ def generate_srt_file(script: str, duration: float, out_path: str = "/tmp/captio
 def synthesize_speech(text: str, with_timepoints: bool = False):
     """読み上げ用原稿を SSML へ変換して Google TTS で合成。"""
     ssml = prepare_tts_script(text)
-    enable_tp = [texttospeech.TimepointType.WORD] if with_timepoints else None
+    # TimepointType はライブラリバージョンで場所が異なる場合があるため安全に取得
+    if with_timepoints:
+        try:
+            TimepointType = texttospeech.TimepointType  # type: ignore[attr-defined]
+        except AttributeError:
+            from google.cloud.texttospeech_v1.types import SynthesizeSpeechRequest as _SSR  # type: ignore
+            TimepointType = _SSR.TimepointType  # type: ignore
+        enable_tp = [TimepointType.WORD]
+    else:
+        enable_tp = None
 
     creds = get_service_account_creds()
     tts = texttospeech.TextToSpeechClient(credentials=creds)
