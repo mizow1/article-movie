@@ -386,11 +386,12 @@ def process_row(row: int, url: str):
         sheet.update(f"D{row}", f"原稿生成失敗: {e}")
         raise
 
-    # 判定: 画像または原稿が無い場合はスキップ扱い
-    if not images or not script.strip():
+    # 判定: 原稿が無い、または画像が無いのに生成無効フラグが立っていない場合のみスキップ
+    missing_images_unexpected = (not images) and (not DISABLE_IMAGE_GEN)
+    if missing_images_unexpected or not script.strip():
         reason = []
-        if not images:
-            reason.append("画像なし")
+        if missing_images_unexpected:
+            reason.append("画像生成失敗")
         if not script.strip():
             reason.append("原稿なし")
         sheet.update(f"D{row}", "/".join(reason) or "スキップ")
