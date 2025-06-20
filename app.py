@@ -665,10 +665,9 @@ def process_row(row: int, url: str, publish_at: str | None = None, publish_date_
     except Exception:
         logging.exception("Failed to open voice file for duration, fallback 0")
         duration = 0.0
-    srt_path = str(Path(out_path).with_suffix(".srt"))
-    generate_srt_file(script, duration, out_path=srt_path, timepoints=tps)
-
-    # 動画生成
+    # --------------------
+    # 動画ファイル名決定
+    # --------------------
     # 日付取得（引数優先）
     raw_date = (publish_date_raw or "").strip() or (sheet.acell(f"F{row}").value or "").strip()
     from datetime import datetime
@@ -688,6 +687,10 @@ def process_row(row: int, url: str, publish_at: str | None = None, publish_date_
     title = script.split("\n")[0][:50]
     out_path = f"/tmp/{_sanitize_filename(f'{date_yyyymmdd}_{title}')}.mp4"
     video_path = make_video(images, voice, out_path)
+
+    # SRT 生成（動画と同じファイル名）
+    srt_path = str(Path(out_path).with_suffix(".srt"))
+    generate_srt_file(script, duration, out_path=srt_path, timepoints=tps)
 
     # アップロード
     drive_url = upload_drive(video_path)
