@@ -108,20 +108,32 @@ def get_sheet():
 # 1) 記事取得
 # ----------------------------------------------------------------------------
 
-def fetch_article(url: str) -> str:
+def fetch_article(url: str) -> tuple[str, str]:  # returns (title, body)
     text_parts, visited = [], set()
     logging.info(f"fetch_article: start url={url}")
+    title = ""
     while url and url not in visited:
         logging.info("fetch_article: visiting %s", url)
         visited.add(url)
         resp = requests.get(url, timeout=15)
+        if not title:
+            # og:title or <title>
+            try:
+                soup_ = bs4.BeautifulSoup(resp.text, "lxml")
+                og = soup_.find("meta", property="og:title")
+                title = og["content"].strip() if og and og.get("content") else ""
+                if not title and soup_.title:
+                    title = soup_.title.get_text(strip=True)
+            except Exception:
+                pass
         article_text = trafilatura.extract(resp.text, favor_recall=True)
         if article_text:
             text_parts.append(article_text)
         soup = bs4.BeautifulSoup(resp.text, "lxml")
         next_link = soup.find("link", rel="next")
         url = urllib.parse.urljoin(url, next_link["href"]) if next_link else None
-    return "\n\n".join(text_parts).strip()
+    body = "\n\n".join(text_parts).strip()
+    return title or "", body
 
 # ----------------------------------------------------------------------------
 # 2) 画像生成 (GPT-4o + DALL·E3)
@@ -230,7 +242,10 @@ def clean_narration(text: str) -> str:
     cleaned_lines: list[str] = []
     for line in text.splitlines():
         # 行頭 Markdown 記号除去
-        line = re.sub(r"^\s*[#>*-]+\s*", "", line)
+        # **bold** を除去
+        line = re.sub(r"\*\*(.*?)\*\*", r"\1", line)
+        # 行頭 Markdown 記号除去
+        line = re.sub(r"^\s*[#>\-*]+\s*", "", line)
         # 読み優先:  漢字（かな）→かな
         def _kana_sub(match):
             kanji, reading = match.group(1), match.group(2)
@@ -521,7 +536,7 @@ def upload_drive(file_path: str) -> str:
 # 7) YouTube アップロード
 # ----------------------------------------------------------------------------
 
-def upload_youtube(file_path: str, title: str, caption: str | None = None, publish_at: str | None = None, srt_path: str | None = None) -> str:
+def upload_youtube(file_path: str, title: str, caption: str | None = None, publish_at: str | None = None, srt_path: str | None = None, draft: bool = False) -> str:
     yt_creds = get_youtube_creds()
     yt = build("youtube", "v3", credentials=yt_creds)
     body = {
@@ -532,7 +547,9 @@ def upload_youtube(file_path: str, title: str, caption: str | None = None, publi
         },
         "status": {},
     }
-    if publish_at:
+    if draft:
+        body["status"].update({"privacyStatus": "private"})
+    elif publish_at:
         # 予約公開
         body["status"].update({"privacyStatus": "private", "publishAt": publish_at})
     else:
@@ -624,9 +641,9 @@ def update_sheet(row: int, drive_url: str, yt_url: str, script: str, article: st
 # メイン処理関数
 # ----------------------------------------------------------------------------
 
-def process_row(row: int, url: str, publish_at: str | None = None, publish_date_raw: str | None = None):
+def process_row(row: int, url: str, publish_at: str | None = None, publish_date_raw: str | None = None, draft: bool = False):
     sheet = get_sheet()
-    article = fetch_article(url)
+    article_title, article = fetch_article(url)
 
     # 画像生成
     images: list[str] = []
@@ -639,7 +656,7 @@ def process_row(row: int, url: str, publish_at: str | None = None, publish_date_
     # ナレーション生成
     script = ""
     try:
-        script = clean_narration(create_narration(article))
+        script = clean_narration(create_narration(article_title + "\n" + article))
     except Exception as e:
         sheet.update(f"D{row}", f"原稿生成失敗: {e}")
         raise
@@ -684,7 +701,8 @@ def process_row(row: int, url: str, publish_at: str | None = None, publish_date_
                 date_yyyymmdd = "".join(m)[:8]
     if not date_yyyymmdd:
         date_yyyymmdd = datetime.now().strftime("%Y%m%d")
-    title = script.split("\n")[0][:50]
+    title_raw = article_title or script.split("\n")[0]
+    title = title_raw[:50] if title_raw else "ニュース"
     out_path = f"/tmp/{_sanitize_filename(f'{date_yyyymmdd}_{title}')}.mp4"
     video_path = make_video(images, voice, out_path)
 
@@ -701,6 +719,7 @@ def process_row(row: int, url: str, publish_at: str | None = None, publish_date_
         caption=caption_text,
         publish_at=publish_at,
         srt_path=srt_path,
+        draft=draft,
     )
     update_sheet(row, drive_url, yt_url, script, article)
     return {"row": row, "drive": drive_url, "yt": yt_url, "srt": srt_path}
@@ -720,18 +739,33 @@ def process():
         url, exec_flag, publish_date = r[0], r[4].strip(), r[5]
         publish_at = None
         if publish_date:
-            try:
-                from datetime import datetime, timezone, timedelta
-                dt = datetime.fromisoformat(publish_date)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))
-                if dt > datetime.now(dt.tzinfo):
-                    publish_at = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-            except Exception:
+            from datetime import datetime, timezone, timedelta, time as dtime
+            def _parse_date(s: str):
+                s = s.strip()
+                for sep in ("-", "/", "."):
+                    if sep in s:
+                        parts = s.split(sep)
+                        if len(parts) >= 3 and all(p.isdigit() for p in parts[:3]):
+                            y, m, d = map(int, parts[:3])
+                            return datetime(y, m, d)
+                if len(s) >= 8 and s.isdigit():
+                    return datetime(int(s[:4]), int(s[4:6]), int(s[6:8]))
+                return None
+            dt_base = _parse_date(publish_date)
+            if dt_base:
+                # デフォルト公開時刻 10:00 JST
+                dt = dt_base.replace(hour=10)  # naive
+                dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))
+                now_jst = datetime.now(tz=timezone(timedelta(hours=9)))
+                if dt <= now_jst:
+                    dt = now_jst + timedelta(minutes=30)  # 30分後に調整
+                publish_at = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            else:
                 logging.warning("Invalid publish_date format: %s", publish_date)
         if url and exec_flag == "1":
             try:
-                res = process_row(idx, url, publish_at, publish_date)
+                draft_flag = not publish_date.strip()
+                res = process_row(idx, url, publish_at, publish_date, draft=draft_flag)
                 res["status"] = "success"
                 results.append(res)
             except Exception as e:
