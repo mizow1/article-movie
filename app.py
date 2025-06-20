@@ -214,6 +214,36 @@ def create_narration(article: str) -> str:
     return script
 
 # ----------------------------------------------------------------------------
+# ナレーション後処理: 記号除去・ふりがな簡略化
+# ----------------------------------------------------------------------------
+
+def clean_narration(text: str) -> str:
+    """字幕/音声向けに不要なマークダウン記号や重複語を除去する。
+
+    処理内容:
+    1. 行頭の Markdown 見出し/箇条書き記号 (#, ##, -, *) を除去。
+    2.  "語（よみ）" 形式は読みのみ残す。
+    3. 重複スペースを1つへ。
+    """
+    import re
+
+    cleaned_lines: list[str] = []
+    for line in text.splitlines():
+        # 行頭 Markdown 記号除去
+        line = re.sub(r"^\s*[#>*-]+\s*", "", line)
+        # 読み優先:  漢字（かな）→かな
+        def _kana_sub(match):
+            kanji, reading = match.group(1), match.group(2)
+            # ひらがなorカタカナのみなら読みを採用、そうでなければ元
+            return reading if re.fullmatch(r"[ぁ-ゖァ-ヺー]+", reading) else reading
+        line = re.sub(r"([^\s（）()]+)[（(]([^）)]+)[）)]", _kana_sub, line)
+        cleaned_lines.append(line.strip())
+    text = "\n".join(l for l in cleaned_lines if l)
+    # 連続空白
+    text = re.sub(r"\s{2,}", " ", text)
+    return text
+
+# ----------------------------------------------------------------------------
 # 4) 朗読原稿処理 & 音声合成 (Google TTS)
 # ----------------------------------------------------------------------------
 
@@ -609,7 +639,7 @@ def process_row(row: int, url: str, publish_at: str | None = None):
     # ナレーション生成
     script = ""
     try:
-        script = create_narration(article)
+        script = clean_narration(create_narration(article))
     except Exception as e:
         sheet.update(f"D{row}", f"原稿生成失敗: {e}")
         raise
