@@ -116,20 +116,24 @@ def fetch_article(url: str) -> tuple[str, str]:  # returns (title, body)
         logging.info("fetch_article: visiting %s", url)
         visited.add(url)
         resp = requests.get(url, timeout=15)
+        html_bytes = resp.content  # raw bytes to avoid premature decoding
         if not title:
             # og:title or <title>
             try:
-                soup_ = bs4.BeautifulSoup(resp.text, "lxml")
+                soup_ = bs4.BeautifulSoup(html_bytes, "lxml", from_encoding=None)
                 og = soup_.find("meta", property="og:title")
                 title = og["content"].strip() if og and og.get("content") else ""
                 if not title and soup_.title:
                     title = soup_.title.get_text(strip=True)
             except Exception:
                 pass
-        article_text = trafilatura.extract(resp.text, favor_recall=True)
+        try:
+            article_text = trafilatura.extract(html_bytes, favor_recall=True)
+        except Exception:
+            article_text = trafilatura.extract(resp.text, favor_recall=True)
         if article_text:
             text_parts.append(article_text)
-        soup = bs4.BeautifulSoup(resp.text, "lxml")
+        soup = bs4.BeautifulSoup(html_bytes, "lxml", from_encoding=None)
         next_link = soup.find("link", rel="next")
         url = urllib.parse.urljoin(url, next_link["href"]) if next_link else None
     body = "\n\n".join(text_parts).strip()
