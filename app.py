@@ -638,7 +638,7 @@ def process_row(row: int, url: str, publish_at: str | None = None):
     srt_path = generate_srt_file(script, duration, timepoints=tps)
 
     # 動画生成
-    publish_date = sheet.get_value(f"F{row}")
+    publish_date = sheet.acell(f"F{row}").value
     title = script.split("\n")[0][:50]
     out_path = f"/tmp/{_sanitize_filename(f'{publish_date}_{title}')}.mp4"
     video_path = make_video(images, voice, out_path)
