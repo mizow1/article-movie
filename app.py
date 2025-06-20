@@ -655,9 +655,7 @@ def process_row(row: int, url: str, publish_at: str | None = None):
     )
     update_sheet(row, drive_url, yt_url, script, article)
     return {"row": row, "drive": drive_url, "yt": yt_url, "srt": srt_path}
-                logging.exception("process_row failed")
-                sheet.update(f"D{idx}", str(e))
-                results.append({"row": idx, "error": str(e)})
+
     return jsonify(results)
 
 # ----------------------------------------------------------------------------
