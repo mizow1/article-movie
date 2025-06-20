@@ -656,6 +656,39 @@ def process_row(row: int, url: str, publish_at: str | None = None):
     update_sheet(row, drive_url, yt_url, script, article)
     return {"row": row, "drive": drive_url, "yt": yt_url, "srt": srt_path}
 
+# ----------------------------------------------------------------------------
+# Flask ルーティング
+# ----------------------------------------------------------------------------
+
+@app.route("/process", methods=["POST"])
+def process():
+    logging.info("/process: start processing spreadsheet rows")
+    results = []
+    sheet = get_sheet()
+    rows = sheet.get_all_values()[1:]  # ヘッダー除外
+    for idx, r in enumerate(rows, start=2):
+        r = (r + [""] * 8)[:8]
+        url, exec_flag, publish_date = r[0], r[4].strip(), r[5]
+        publish_at = None
+        if publish_date:
+            try:
+                from datetime import datetime, timezone, timedelta
+                dt = datetime.fromisoformat(publish_date)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))
+                if dt > datetime.now(dt.tzinfo):
+                    publish_at = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            except Exception:
+                logging.warning("Invalid publish_date format: %s", publish_date)
+        if url and exec_flag == "1":
+            try:
+                res = process_row(idx, url, publish_at)
+                res["status"] = "success"
+                results.append(res)
+            except Exception as e:
+                logging.exception("process_row failed")
+                sheet.update(f"D{idx}", str(e))
+                results.append({"row": idx, "error": str(e)})
     return jsonify(results)
 
 # ----------------------------------------------------------------------------
