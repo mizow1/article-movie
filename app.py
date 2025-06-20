@@ -624,7 +624,7 @@ def update_sheet(row: int, drive_url: str, yt_url: str, script: str, article: st
 # メイン処理関数
 # ----------------------------------------------------------------------------
 
-def process_row(row: int, url: str, publish_at: str | None = None):
+def process_row(row: int, url: str, publish_at: str | None = None, publish_date_raw: str | None = None):
     sheet = get_sheet()
     article = fetch_article(url)
 
@@ -665,12 +665,28 @@ def process_row(row: int, url: str, publish_at: str | None = None):
     except Exception:
         logging.exception("Failed to open voice file for duration, fallback 0")
         duration = 0.0
-    srt_path = generate_srt_file(script, duration, timepoints=tps)
+    srt_path = str(Path(out_path).with_suffix(".srt"))
+    generate_srt_file(script, duration, out_path=srt_path, timepoints=tps)
 
     # 動画生成
-    publish_date = sheet.acell(f"F{row}").value
+    # 日付取得（引数優先）
+    raw_date = (publish_date_raw or "").strip() or (sheet.acell(f"F{row}").value or "").strip()
+    from datetime import datetime
+    date_yyyymmdd = ""
+    if raw_date:
+        try:
+            dt = datetime.fromisoformat(raw_date.replace("/", "-"))
+            date_yyyymmdd = dt.strftime("%Y%m%d")
+        except Exception:
+            # 数字抽出 fallback
+            import re
+            m = re.findall(r"\d", raw_date)
+            if len(m) >= 8:
+                date_yyyymmdd = "".join(m)[:8]
+    if not date_yyyymmdd:
+        date_yyyymmdd = datetime.now().strftime("%Y%m%d")
     title = script.split("\n")[0][:50]
-    out_path = f"/tmp/{_sanitize_filename(f'{publish_date}_{title}')}.mp4"
+    out_path = f"/tmp/{_sanitize_filename(f'{date_yyyymmdd}_{title}')}.mp4"
     video_path = make_video(images, voice, out_path)
 
     # アップロード
@@ -712,7 +728,7 @@ def process():
                 logging.warning("Invalid publish_date format: %s", publish_date)
         if url and exec_flag == "1":
             try:
-                res = process_row(idx, url, publish_at)
+                res = process_row(idx, url, publish_at, publish_date)
                 res["status"] = "success"
                 results.append(res)
             except Exception as e:
