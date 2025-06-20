@@ -448,7 +448,13 @@ def synthesize_speech(text: str, with_timepoints: bool = False):
 # 5) 動画生成 (moviepy)
 # ----------------------------------------------------------------------------
 
-def make_video(images: list[str], voice_path: str) -> str:
+def _sanitize_filename(s: str) -> str:
+    """ファイル名に使えない文字を '_' に置換しトリム"""
+    import re
+    s = re.sub(r"[\\/:*?\"<>|\s]+", "_", s)
+    return s.strip("_")
+
+def make_video(images: list[str], voice_path: str, out_path: str) -> str:
     audio_clip = AudioFileClip(voice_path)
     duration = audio_clip.duration
     if images:
@@ -459,7 +465,6 @@ def make_video(images: list[str], voice_path: str) -> str:
         from moviepy.editor import ColorClip
         clips = [ColorClip(size=(1280, 720), color=(0, 0, 0)).set_duration(duration)]
     video = concatenate_videoclips(clips, method="compose").set_audio(audio_clip)
-    out_path = "/tmp/news_video.mp4"
     video.write_videofile(out_path, codec="libx264", audio_codec="aac", fps=30)
     return out_path
 
@@ -473,11 +478,7 @@ def upload_drive(file_path: str) -> str:
     drive = build("drive", "v3", credentials=creds)
 
     # フォルダ存在確認（shared drive も考慮して supportsAllDrives=True）
-    try:
-        drive.files().get(fileId=DRIVE_FOLDER_ID, fields="id", supportsAllDrives=True).execute()
-    except Exception as e:
-        logging.error("upload_drive: folder id %s not accessible: %s", DRIVE_FOLDER_ID, e)
-        raise
+    drive.files().get(fileId=DRIVE_FOLDER_ID, fields="id", supportsAllDrives=True).execute()
 
     meta = {"name": Path(file_path).name, "parents": [DRIVE_FOLDER_ID]}
     media = MediaFileUpload(file_path, mimetype="video/mp4", resumable=True)
@@ -507,8 +508,7 @@ def upload_youtube(file_path: str, title: str, caption: str | None = None, publi
     else:
         body["status"].update({"privacyStatus": "public"})
     media = MediaFileUpload(file_path, resumable=True, mimetype="video/mp4")
-    req = yt.videos().insert(part="snippet,status", body=body, media_body=media)
-    resp = req.execute()
+    resp = yt.videos().insert(part="snippet,status", body=body, media_body=media).execute()
 
     # SRT 字幕があればアップロード
     if srt_path and Path(srt_path).exists():
@@ -529,26 +529,6 @@ def upload_youtube(file_path: str, title: str, caption: str | None = None, publi
             ).execute()
         except Exception:
             logging.exception("upload_youtube: SRT upload failed")
-
-    # プレーンテキスト原稿をキャプションとして挿入 (fallback)
-    if caption:
-        try:
-            from googleapiclient.http import MediaInMemoryUpload
-            media = MediaInMemoryUpload(caption.encode("utf-8"), mimetype="text/plain")
-            yt.captions().insert(
-                part="snippet",
-                body={
-                    "snippet": {
-                        "language": "ja",
-                        "name": "Japanese",
-                        "videoId": resp["id"],
-                        "isDraft": False,
-                    }
-                },
-                media_body=media,
-            ).execute()
-        except Exception:
-            logging.exception("upload_youtube: caption upload failed")
 
     return f"https://youtu.be/{resp['id']}"
 
@@ -618,56 +598,23 @@ def process_row(row: int, url: str, publish_at: str | None = None):
     srt_path = generate_srt_file(script, duration, timepoints=tps)
 
     # 動画生成
-    video = make_video(images, voice)
+    publish_date = sheet.get_value(f"F{row}")
+    title = script.split("\n")[0][:50]
+    out_path = f"/tmp/{_sanitize_filename(f'{publish_date}_{title}')}.mp4"
+    video_path = make_video(images, voice, out_path)
+
     # アップロード
-    drive_url = upload_drive(video)
+    drive_url = upload_drive(video_path)
     caption_text = article
     yt_url = upload_youtube(
-        video,
-        script.split("\n")[0][:50],
+        video_path,
+        title,
         caption=caption_text,
         publish_at=publish_at,
         srt_path=srt_path,
     )
     update_sheet(row, drive_url, yt_url, script, article)
     return {"row": row, "drive": drive_url, "yt": yt_url, "srt": srt_path}
-
-# ----------------------------------------------------------------------------
-# Flask ルーティング
-# ----------------------------------------------------------------------------
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
-
-
-@app.route("/process", methods=["POST"])
-def process():
-    logging.info("/process: start processing spreadsheet rows")
-    results = []
-    sheet = get_sheet()
-    rows = sheet.get_all_values()[1:]  # ヘッダー除外
-    for idx, r in enumerate(rows, start=2):
-        # パディングして列数を揃える
-        r = (r + [""] * 8)[:8]
-        url, exec_flag, publish_date = r[0], r[4].strip(), r[5]
-        publish_at = None
-        if publish_date:
-            try:
-                from datetime import datetime, timezone, timedelta
-                dt = datetime.fromisoformat(publish_date)
-                if dt.tzinfo is None:
-                    dt = dt.replace(tzinfo=timezone(timedelta(hours=9)))
-                if dt > datetime.now(dt.tzinfo):
-                    publish_at = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-            except Exception:
-                logging.warning("Invalid publish_date format: %s", publish_date)
-        if url and exec_flag == "1":
-            try:
-                res = process_row(idx, url, publish_at)
-                res["status"] = "success"
-                results.append(res)
-            except Exception as e:
                 logging.exception("process_row failed")
                 sheet.update(f"D{idx}", str(e))
                 results.append({"row": idx, "error": str(e)})
