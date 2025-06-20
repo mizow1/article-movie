@@ -512,9 +512,9 @@ def upload_youtube(file_path: str, title: str, caption: str | None = None, publi
 
     # SRT 字幕があればアップロード
     if srt_path and Path(srt_path).exists():
+        from googleapiclient.http import MediaFileUpload as _MFU
+        media = _MFU(srt_path, mimetype="application/x-subrip", resumable=False)
         try:
-            from googleapiclient.http import MediaFileUpload as _MFU
-            media = _MFU(srt_path, mimetype="application/x-subrip", resumable=False)
             yt.captions().insert(
                 part="snippet",
                 body={
@@ -527,8 +527,48 @@ def upload_youtube(file_path: str, title: str, caption: str | None = None, publi
                 },
                 media_body=media,
             ).execute()
-        except Exception:
-            logging.exception("upload_youtube: SRT upload failed")
+        except googleapiclient.errors.HttpError as e:
+            # 409: 同名トラックが既に存在する場合は上書き
+            if e.resp.status == 409:
+                logging.info("Caption already exists – updating instead of inserting")
+                # 既存トラック取得
+                existing = yt.captions().list(part="id,snippet", videoId=resp["id"]).execute()
+                ja_id = None
+                for item in existing.get("items", []):
+                    sn = item.get("snippet", {})
+                    if sn.get("language") == "ja" and sn.get("name") == "Japanese":
+                        ja_id = item["id"]
+                        break
+                if ja_id:
+                    yt.captions().update(
+                        part="snippet",
+                        body={
+                            "id": ja_id,
+                            "snippet": {
+                                "language": "ja",
+                                "name": "Japanese",
+                                "videoId": resp["id"],
+                                "isDraft": False,
+                            },
+                        },
+                        media_body=media,
+                    ).execute()
+                else:
+                    # 同名は無いが409? → nameを付け替えて再挿入
+                    yt.captions().insert(
+                        part="snippet",
+                        body={
+                            "snippet": {
+                                "language": "ja",
+                                "name": f"Japanese_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}",
+                                "videoId": resp["id"],
+                                "isDraft": False,
+                            }
+                        },
+                        media_body=media,
+                    ).execute()
+            else:
+                logging.exception("upload_youtube: SRT upload failed")
 
     return f"https://youtu.be/{resp['id']}"
 
