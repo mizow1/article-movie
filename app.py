@@ -411,19 +411,31 @@ def synthesize_speech(text: str, with_timepoints: bool = False):
     voice = texttospeech.VoiceSelectionParams(
         language_code="ja-JP", name="ja-JP-Standard-B"
     )
-    audio_cfg = texttospeech.AudioConfig(
-        audio_encoding=texttospeech.AudioEncoding.MP3,
-        speaking_rate=1.05,
+    audio_config = texttospeech.AudioConfig(
+        audio_encoding=texttospeech.AudioEncoding.LINEAR16,
     )
+
+    request_base = {
+        "input": input_text,
+        "voice": voice,
+        "audio_config": audio_config,
+    }
+    if enable_tp:
+        request_base["enable_time_pointing"] = enable_tp
+
     try:
-        audio = tts.synthesize_speech(
-            input=input_text,
-            voice=voice,
-            audio_config=audio_cfg,
-            enable_time_pointing=enable_tp,  # type: ignore[arg-type]
-        )
-    except Exception:
-        logging.exception("synthesize_speech: Google TTS failed for text snippet=%s", text[:200])
+        audio = tts.synthesize_speech(request=request_base)
+    except TypeError as te:
+        # 古いライブラリでは enable_time_pointing が未対応
+        if "enable_time_pointing" in str(te):
+            logging.warning("synthesize_speech: enable_time_pointing not supported, retrying without word timepoints")
+            request_base.pop("enable_time_pointing", None)
+            audio = tts.synthesize_speech(request=request_base)
+            enable_tp = None  # タイムポイント取得なし
+        else:
+            raise
+    except Exception as e:
+        logging.error("synthesize_speech: Google TTS failed for text snippet=%s\n%s", text[:120], e)
         raise
     out_path = "/tmp/voice.mp3"
     with open(out_path, "wb") as fp:
