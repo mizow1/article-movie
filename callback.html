@@ -1,0 +1,30 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>TikTok OAuth Callback</title>
+</head>
+<body>
+  <h2>認証処理中です…</h2>
+  <script>
+    // URLSearchParams を使って "code" パラメータを取得
+    const params = new URLSearchParams(window.location.search);
+    const code = params.get("code");
+    const state = params.get("state");
+
+    if (code) {
+      console.log("Authorization Code:", code);
+      // 以下のように、バックエンドへ送信するなどの処理も可能（例）
+      // fetch("https://your-backend.com/tiktok/callback", {
+      //   method: "POST",
+      //   headers: { "Content-Type": "application/json" },
+      //   body: JSON.stringify({ code, state })
+      // });
+
+      document.body.innerHTML = `<p>認証コードを受け取りました。<br>コード: <code>${code}</code></p>`;
+    } else {
+      document.body.innerHTML = "<p>認証コードが見つかりませんでした。</p>";
+    }
+  </script>
+</body>
+</html>
