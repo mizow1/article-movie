@@ -503,19 +503,67 @@ def _sanitize_filename(s: str) -> str:
     s = re.sub(r"[\\/:*?\"<>|\s]+", "_", s)
     return s.strip("_")
 
-def make_video(images: list[str], voice_path: str, out_path: str) -> str:
+def make_video(
+    images: list[str],
+    voice_path: str,
+    out_path: str,
+    size: tuple[int, int] = (1280, 720),
+    max_duration: int | None = None,
+    fps: int = 30,
+) -> str:
+    """画像＋音声から単純なスライドショー動画を生成する。
+
+    Args:
+        images: 画像ファイルパスのリスト。空の場合は黒背景。
+        voice_path: ナレーション音声ファイルパス。
+        out_path: 出力MP4。
+        size: (width, height)。デフォルト1280x720。
+        max_duration: 秒指定時、音声と動画をこの長さでトリミング。
+        fps: 出力フレームレート。
+    """
+    from moviepy.editor import AudioFileClip, ImageClip, ColorClip, concatenate_videoclips
+
     audio_clip = AudioFileClip(voice_path)
+    # 長さ制限（Shorts/TikTok用）
+    if max_duration and audio_clip.duration > max_duration:
+        audio_clip = audio_clip.subclip(0, max_duration)
     duration = audio_clip.duration
+
+    # 画像→VideoClip 化
     if images:
         img_duration = duration / len(images)
-        clips = [ImageClip(p).set_duration(img_duration) for p in images]
+        clips: list[ImageClip] = []
+        for path in images:
+            clip = ImageClip(path)
+            # リサイズ→クロップで指定アスペクトへ合わせる
+            clip = clip.resize(height=size[1]) if clip.h < clip.w else clip.resize(width=size[0])
+            clip = clip.crop(x_center=clip.w / 2, y_center=clip.h / 2, width=size[0], height=size[1])
+            clips.append(clip.set_duration(img_duration))
     else:
-        # 黒背景のみで動画を生成
-        from moviepy.editor import ColorClip
-        clips = [ColorClip(size=(1280, 720), color=(0, 0, 0)).set_duration(duration)]
+        clips = [ColorClip(size=size, color=(0, 0, 0)).set_duration(duration)]
+
     video = concatenate_videoclips(clips, method="compose").set_audio(audio_clip)
-    video.write_videofile(out_path, codec="libx264", audio_codec="aac", fps=30)
+    video.write_videofile(out_path, codec="libx264", audio_codec="aac", fps=fps, preset="medium", threads=4)
     return out_path
+
+
+def make_video_variants(
+    images: list[str],
+    voice_path: str,
+    base_filename: str,
+    max_duration_short: int = 60,
+) -> dict[str, str]:
+    """横長(16:9)と縦長(9:16)の2種類を生成しファイルパスを返す。"""
+    from pathlib import Path
+
+    base = Path(base_filename).with_suffix("")
+    horizontal_path = f"{base}_h.mp4"
+    vertical_path = f"{base}_v.mp4"
+    # 横長 1280x720 (16:9)
+    make_video(images, voice_path, horizontal_path, size=(1280, 720))
+    # 縦長 1080x1920 (9:16) & 60秒以内
+    make_video(images, voice_path, vertical_path, size=(1080, 1920), max_duration=max_duration_short)
+    return {"horizontal": horizontal_path, "vertical": vertical_path}
 
 # ----------------------------------------------------------------------------
 # 6) Google Drive アップロード
@@ -540,9 +588,21 @@ def upload_drive(file_path: str) -> str:
 # 7) YouTube アップロード
 # ----------------------------------------------------------------------------
 
-def upload_youtube(file_path: str, title: str, caption: str | None = None, publish_at: str | None = None, srt_path: str | None = None, draft: bool = False) -> str:
+def upload_youtube(
+    file_path: str,
+    title: str,
+    caption: str | None = None,
+    publish_at: str | None = None,
+    srt_path: str | None = None,
+    draft: bool = False,
+    shorts: bool = False,
+) -> str:
     yt_creds = get_youtube_creds()
     yt = build("youtube", "v3", credentials=yt_creds)
+    # Shorts 判定用にハッシュタグ追加
+    if shorts and "#shorts" not in title.lower():
+        title += " #shorts"
+
     body = {
         "snippet": {
             "title": title,
@@ -551,6 +611,8 @@ def upload_youtube(file_path: str, title: str, caption: str | None = None, publi
         },
         "status": {},
     }
+    if shorts:
+        body["snippet"].setdefault("tags", []).append("shorts")
     if draft:
         body["status"].update({"privacyStatus": "private"})
     elif publish_at:
@@ -621,19 +683,79 @@ def upload_youtube(file_path: str, title: str, caption: str | None = None, publi
             else:
                 logging.exception("upload_youtube: SRT upload failed")
 
-    return f"https://youtu.be/{resp['id']}"
+        return f"https://youtu.be/{resp['id']}"
+
+
+# ----------------------------------------------------------------------------
+# 7-2) Instagram / TikTok / Twitter アップロード (スタブ)
+# ----------------------------------------------------------------------------
+
+def _missing_cred_msg(service: str, envs: list[str]):
+    return f"{service} アクセスに必要な環境変数が不足しています: {', '.join(envs)}"
+
+
+def upload_instagram(file_path: str, caption: str) -> str:
+    """Instagram Reels へ動画を投稿 (スタブ)。Env が無ければ空文字を返す。"""
+    required = ["IG_ACCESS_TOKEN", "IG_USER_ID"]
+    if any(not os.environ.get(v) for v in required):
+        logging.warning(_missing_cred_msg("Instagram", required))
+        return ""
+    # 本実装では Graph API の /media, /media_publish を使用
+    # TODO: implement
+    logging.info("upload_instagram: stub called, returning placeholder URL")
+    return "https://instagram.com/reel/PLACEHOLDER"
+
+
+def upload_tiktok(file_path: str, caption: str) -> str:
+    """TikTok へ動画を投稿 (スタブ)。"""
+    required = ["TIKTOK_ACCESS_TOKEN", "TIKTOK_CLIENT_KEY"]
+    if any(not os.environ.get(v) for v in required):
+        logging.warning(_missing_cred_msg("TikTok", required))
+        return ""
+    # TODO: implement TikTok Upload API
+    logging.info("upload_tiktok: stub called, returning placeholder URL")
+    return "https://tiktok.com/@user/video/PLACEHOLDER"
+
+
+def upload_twitter(file_path: str, caption: str) -> str:
+    """Twitter(X) へ動画を投稿 (スタブ)。"""
+    required = ["TWITTER_BEARER_TOKEN", "TWITTER_API_KEY", "TWITTER_API_SECRET"]
+    if any(not os.environ.get(v) for v in required):
+        logging.warning(_missing_cred_msg("Twitter", required))
+        return ""
+    # TODO: implement Twitter v2 media upload + tweet
+    logging.info("upload_twitter: stub called, returning placeholder URL")
+    return "https://twitter.com/user/status/PLACEHOLDER"
 
 # ----------------------------------------------------------------------------
 # 8) スプレッドシート更新
 # ----------------------------------------------------------------------------
 
-def update_sheet(row: int, drive_url: str, yt_url: str, script: str, article: str):
+def update_sheet(
+    row: int,
+    drive_url: str,
+    yt_url: str,
+    yt_short_url: str | None,
+    ig_url: str | None,
+    tiktok_url: str | None,
+    tw_url: str | None,
+    script: str,
+    article: str,
+):
     """指定行の各セルを更新し、生成フラグを 2 にセットする。"""
     sheet = get_sheet()
     if drive_url:
         sheet.update(f"B{row}", drive_url)
     if yt_url:
         sheet.update(f"C{row}", yt_url)
+    if yt_short_url:
+        sheet.update(f"I{row}", yt_short_url)
+    if ig_url:
+        sheet.update(f"J{row}", ig_url)
+    if tiktok_url:
+        sheet.update(f"K{row}", tiktok_url)
+    if tw_url:
+        sheet.update(f"L{row}", tw_url)
     if article:
         sheet.update(f"G{row}", article[:5000])
     if script:
@@ -707,11 +829,13 @@ def process_row(row: int, url: str, publish_at: str | None = None, publish_date_
         date_yyyymmdd = datetime.now().strftime("%Y%m%d")
     title_raw = article_title or script.split("\n")[0]
     title = title_raw[:50] if title_raw else "ニュース"
-    out_path = f"/tmp/{_sanitize_filename(f'{date_yyyymmdd}_{title}')}.mp4"
-    video_path = make_video(images, voice, out_path)
+    base_path = f"/tmp/{_sanitize_filename(f'{date_yyyymmdd}_{title}')}.mp4"
+    videos = make_video_variants(images, voice, base_path)
+    video_path = videos["horizontal"]
+    short_path = videos["vertical"]
 
-    # SRT 生成（動画と同じファイル名）
-    srt_path = str(Path(out_path).with_suffix(".srt"))
+    # SRT 生成（横長動画と同じファイル名）
+    srt_path = str(Path(video_path).with_suffix(".srt"))
     generate_srt_file(script, duration, out_path=srt_path, timepoints=tps)
 
     # アップロード
@@ -725,8 +849,32 @@ def process_row(row: int, url: str, publish_at: str | None = None, publish_date_
         srt_path=srt_path,
         draft=draft,
     )
-    update_sheet(row, drive_url, yt_url, script, article)
-    return {"row": row, "drive": drive_url, "yt": yt_url, "srt": srt_path}
+    # Shorts アップロード
+    yt_short_url = upload_youtube(
+        short_path,
+        title,
+        caption=caption_text,
+        publish_at=publish_at,
+        srt_path=None,
+        draft=draft,
+        shorts=True,
+    )
+    # Instagram / TikTok / Twitter
+    ig_url = upload_instagram(short_path, caption_text)
+    tiktok_url = upload_tiktok(short_path, caption_text)
+    tw_url = upload_twitter(short_path, caption_text)
+
+    update_sheet(row, drive_url, yt_url, yt_short_url, ig_url, tiktok_url, tw_url, script, article)
+    return {
+        "row": row,
+        "drive": drive_url,
+        "yt": yt_url,
+        "yt_shorts": yt_short_url,
+        "instagram": ig_url,
+        "tiktok": tiktok_url,
+        "twitter": tw_url,
+        "srt": srt_path,
+    }
 
 # ----------------------------------------------------------------------------
 # Flask ルーティング
