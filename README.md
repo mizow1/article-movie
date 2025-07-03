@@ -96,8 +96,15 @@ pip install -r requirements.txt
     gcloud config set project article-movie
     SHEET="https://docs.google.com/spreadsheets/d/1GJJlgi661ofOfDHqjVIvdDEa9xmhK2SHyyxiqHi3RuA/edit?gid=0" && gcloud run deploy news-video-generator --source=. --region=asia-northeast1 --project=article-movie --memory=2Gi --cpu=2 --timeout=3600 --set-env-vars=SHEET_URL=${SHEET},DRIVE_FOLDER_ID=1DQWj1mSSFwjf02odaZDO3_2QNn7wr58Q,DISABLE_IMAGE_GEN=1 --set-secrets=OPENAI_API_KEY=OPENAI_API_KEY:latest,GCP_SA_JSON_SECRET=GCP_SA_JSON_SECRET:latest,YOUTUBE_TOKEN_JSON=YOUTUBE_TOKEN_JSON:latest
     ```
+- 出力
+    ```bash
+    curl -X POST https://news-video-generator-907276727531.asia-northeast1.run.app/process
+    ```
 - 成功すればスプレッドシートに動画URLが出力される。
-
+- 失敗時はログで原因追跡
+    ```bash
+    gcloud run services logs read news-video-generator --limit=100 --region=asia-northeast1
+    ```
 
 ### 3. Google Sheetsの形式
 | A列(URL) | B列(動画URL) | C列(YouTube) | D列(エラー内容) | E列(実行フラグ) | F列(公開日) | G列(表記原稿) | H列(読み上げ原稿) | I列(YT Shorts) | J列(Instagram) | K列(TikTok) | L列(Twitter) |
